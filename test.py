@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 import plotly.io as pio
 import sqlite3
 from datetime import datetime
-#from fpdf import FPDF
+from fpdf import FPDF
 import base64
 import re
 import io
@@ -43,10 +43,9 @@ def color_delta(val):
 
 def format_dhm(seconds):
     seconds = max(0, seconds)
-    d, h_rem = divmod(int(seconds), 86400)
-    h, m_rem = divmod(h_rem, 3600)
-    m, _ = divmod(m_rem, 60)
-    return f"{d}d {h}h {m}m"
+    h, m_rem = divmod(int(seconds), 3600)
+    m, s = divmod(m_rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 def clean_duration(series):
     def parse(x):
@@ -113,9 +112,12 @@ def get_total_context_cycles(df_source, date_range, sel_device):
     v_cyc = window_df[window_df['SystemCounter'] > 0]
     return int(v_cyc.groupby('DeviceName')['SystemCounter'].agg(lambda x: max(0, x.max() - x.min())).sum()) if not v_cyc.empty else 0
 
-# --- THE HYBRID CHART ENGINE (WITH OTHERS TOGGLE) ---
-def create_cluster_stack(df_w1, df_w2, x_col, stack_col, title, top_n, show_others):
+# --- THE HYBRID CHART ENGINE (WITH DYNAMIC HOVER) ---
+def create_cluster_stack(df_w1, df_w2, x_col, stack_col, title, top_n, show_others, metric, desc_map=None, is_master=False):
     fig = go.Figure()
+    val_col = 'EventCount' if metric == "Count" else 'DurationTotal'
+    y_label = "Count of Event Code" if metric == "Count" else "Duration (Mins)"
+    
     w1_shades = ['#082245','#08306B','#08519C','#2171B5','#4292C6','#6BAED6','#9ECAE1','#C6DBEF','#DEEBF7','#F7FBFF']
     w2_shades = ['#67000D','#A50F15','#CB181D','#EF3B2C','#FB6A4A','#FC9272','#FCBBA1','#FEE0D2','#FFF5F0','#FFFBFB']
     
@@ -123,15 +125,15 @@ def create_cluster_stack(df_w1, df_w2, x_col, stack_col, title, top_n, show_othe
         if df.empty or top_n == "All": return df
         n_val = int(top_n.split()[-1])
         df = df.copy()
-        df['rank'] = df.groupby(x_col)['EventCount'].rank(method='first', ascending=False)
+        df['rank'] = df.groupby(x_col)[val_col].rank(method='first', ascending=False)
         if show_others:
             df.loc[df['rank'] > n_val, stack_col] = "Others"
-            return df.groupby([x_col, stack_col])['EventCount'].sum().reset_index()
+            return df.groupby([x_col, stack_col])[val_col].sum().reset_index()
         else:
             return df[df['rank'] <= n_val]
 
-    clean_w1 = process_top_n(df_w1)
-    clean_w2 = process_top_n(df_w2)
+    c_w1 = process_top_n(df_w1)
+    c_w2 = process_top_n(df_w2)
 
     def add_traces(df, name, offset, shades):
         if df.empty: return
@@ -140,17 +142,31 @@ def create_cluster_stack(df_w1, df_w2, x_col, stack_col, title, top_n, show_othe
         
         for i, cat in enumerate(cats):
             sub = df[df[stack_col] == cat]
+            y_vals = sub[val_col] if metric == "Count" else sub[val_col] / 60
             m_color = "#D3D3D3" if cat == "Others" else shades[i % len(shades)]
+            
+            # --- REQUIREMENT: DYNAMIC TOOLTIP LOGIC ---
+            v_str = sub[val_col].apply(format_dhm) if metric == "Duration" else sub[val_col].astype(str)
+            
+            if stack_col == 'EventCode' and desc_map:
+                desc = desc_map.get(cat, "N/A")
+                if is_master and len(desc) > 50: desc = desc[:50] + "..." # REQUIREMENT: Master Truncation
+                h_template = f"<b>{name}</b><br>Code: {cat}<br>Desc: {desc}<br>{metric}: {v_str.iloc[0]}<extra></extra>"
+            elif stack_col == 'DeviceName': # REQUIREMENT: Fault Analysis priority
+                h_template = f"<b>{name}</b><br>Machine: {cat}<br>{metric}: {v_str.iloc[0]}<extra></extra>"
+            else:
+                h_template = f"<b>{name}</b><br>{stack_col}: {cat}<br>{metric}: {v_str.iloc[0]}<extra></extra>"
+
             fig.add_trace(go.Bar(
-                name=f"{name}: {cat}", x=sub[x_col], y=sub['EventCount'],
+                name=f"{name}: {cat}", x=sub[x_col], y=y_vals,
                 offsetgroup=offset, marker=dict(color=m_color, line=dict(color='white', width=0.5)),
                 legendgroup=name, legendgrouptitle_text=name,
-                hovertemplate=f"<b>{name}</b><br>{stack_col}: {cat}<br>Count: %{{y}}<extra></extra>"
+                hovertemplate=h_template
             ))
 
-    add_traces(clean_w1, "Window 1", 0, w1_shades)
-    add_traces(clean_w2, "Window 2", 1, w2_shades)
-    fig.update_layout(title=title, barmode='stack', yaxis_title="Count of Event Code", bargap=0.15, bargroupgap=0.1)
+    add_traces(c_w1, "Window 1", 0, w1_shades)
+    add_traces(c_w2, "Window 2", 1, w2_shades)
+    fig.update_layout(title=title, barmode='stack', yaxis_title=y_label, bargap=0.15, bargroupgap=0.1)
     return fig
 
 # --- 3. DIALOGS ---
@@ -188,13 +204,17 @@ if uploaded_file: st.session_state.raw_data = process_upload(uploaded_file)
 
 if st.session_state.raw_data is not None:
     df = st.session_state.raw_data
+    # REQUIREMENT: PRE-MAP DESCRIPTIONS (First encounter logic)
+    desc_lookup = df.groupby('EventCode')['EventDescription'].first().to_dict()
+    
     st.sidebar.header("⚙️ Global Controls")
     sel_device = st.sidebar.selectbox("Device Name Filter", ["All"] + sorted(df['DeviceName'].unique().tolist()))
     sel_types = st.sidebar.multiselect("Event Type Filter", df['EventType'].unique(), default=list(df['EventType'].unique()))
-    
+    chart_metric = st.sidebar.radio("Display Metric in Charts:", ["Count", "Duration"], index=0)
     top_n_filter = st.sidebar.selectbox("Cluster Detail Level", ["Top 5", "Top 10", "All"], index=0)
-    # REQUIREMENT: TOGGLE FOR OTHERS
-    show_others_toggle = st.sidebar.checkbox("Include 'Others' Category in Charts", value=True)
+    show_others_toggle = st.sidebar.checkbox("Include 'Others' Category", value=True)
+    show_master = st.sidebar.checkbox("Generate Master Dashboard Tab", value=False)
+    trend_unit_val = st.sidebar.radio("Trend Unit:", ["Minutes", "Seconds"], key="tu")
     
     w1_dates = st.sidebar.date_input("Time Window 1", [df['EventDate'].min().date(), df['EventDate'].max().date()], key="w1")
     enable_comp = st.sidebar.checkbox("Enable Comparison (Window 2)")
@@ -205,9 +225,12 @@ if st.session_state.raw_data is not None:
     tw_str = f"W1: {w1_dates[0]} to {w1_dates[1]}"
     if enable_comp and len(w2_dates) == 2: tw_str += f" | W2: {w2_dates[0]} to {w2_dates[1]}"
 
-    t1, t2, t3, t4 = st.tabs(["🏠 Main Dashboard", "🔍 Fault Analysis", "🛠️ Tech Log", "📄 Export Reports"])
+    tab_list = ["🏠 Main Dashboard", "🔍 Fault Analysis", "🛠️ Tech Log", "📄 Export Reports"]
+    if show_master: tab_list.insert(1, "📊 Master Dashboard")
+    tabs = st.tabs(tab_list)
+    tab_map = {name: tabs[i] for i, name in enumerate(tab_list)}
 
-    with t1:
+    with tab_map["🏠 Main Dashboard"]:
         st.subheader("Production Line Performance Summary")
         met1_tab = get_metrics_master(df, w1_dates, sel_types, sel_device, ['DeviceName'])
         m_calc = met1_tab if sel_device == "All" else met1_tab[met1_tab['DeviceName'] == sel_device]
@@ -219,16 +242,15 @@ if st.session_state.raw_data is not None:
 
         if not enable_comp:
             cl, cr = st.columns([1, 1.2])
-            with cl: st.plotly_chart(px.pie(met1_tab, names='DeviceName', values='EventCount', hole=0.4, title="Event Distribution"), use_container_width=True)
+            with cl: st.plotly_chart(px.pie(met1_tab, names='DeviceName', values='EventCount' if chart_metric == "Count" else 'DurationTotal', hole=0.4, title=f"Event {chart_metric} Distribution"), use_container_width=True)
             with cr:
                 st.markdown("### Device Performance Details")
-                met1_tab['Action'] = "🔍 View Logs"; met1_tab['Total Downtime'] = met1_tab['DurationTotal'].apply(format_dhm)
+                met1_tab['Action'], met1_tab['Total Downtime'] = "🔍 View Logs", met1_tab['DurationTotal'].apply(format_dhm)
                 st.dataframe(met1_tab[['Action', 'DeviceName', 'EventCount', 'Total Downtime', 'Cycles', 'Fault%']].style.format({'Cycles': '{:,.0f}', 'Fault%': '{:.2f}%'}), use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key=f"t1_{st.session_state.tk_main}")
         else:
             m1_chart = get_metrics_master(df, w1_dates, sel_types, sel_device, ['DeviceName', 'EventCode'])
             m2_chart = get_metrics_master(df, w2_dates, sel_types, sel_device, ['DeviceName', 'EventCode'])
-            st.plotly_chart(create_cluster_stack(m1_chart, m2_chart, 'DeviceName', 'EventCode', "Machine Comparison", top_n_filter, show_others_toggle), use_container_width=True)
-            
+            st.plotly_chart(create_cluster_stack(m1_chart, m2_chart, 'DeviceName', 'EventCode', f"Machine Comparison", top_n_filter, show_others_toggle, chart_metric, desc_map=desc_lookup), use_container_width=True)
             st.markdown("### Row 2: Performance Delta Analysis")
             met2_tab = get_metrics_master(df, w2_dates, sel_types, sel_device, ['DeviceName'])
             comp_df = pd.merge(met1_tab, met2_tab, on='DeviceName', how='outer', suffixes=('_W1', '_W2')).fillna(0)
@@ -241,13 +263,29 @@ if st.session_state.raw_data is not None:
             if t1_sel_c and t1_sel_c.get('selection') and t1_sel_c['selection'].get('rows'):
                 row_c = comp_df.iloc[t1_sel_c['selection']['rows'][0]]; st.session_state.dialog_trigger = {'device': row_c['DeviceName'], 'codes': "All", 'tab': 'main'}
 
-    with t2:
+    if show_master:
+        with tab_map["📊 Master Dashboard"]:
+            st.subheader(f"Fleet-Wide Device Analysis ({chart_metric})")
+            all_devices = sorted(df['DeviceName'].unique().tolist())
+            for i in range(0, len(all_devices), 4):
+                cols = st.columns(4)
+                for j in range(4):
+                    if i + j < len(all_devices):
+                        d_name = all_devices[i+j]
+                        m1_m = get_metrics_master(df, w1_dates, sel_types, d_name, ['DeviceName', 'EventCode'])
+                        m2_m = get_metrics_master(df, w2_dates, sel_types, d_name, ['DeviceName', 'EventCode']) if enable_comp else pd.DataFrame()
+                        with cols[j]:
+                            fig_m = create_cluster_stack(m1_m, m2_m, 'DeviceName', 'EventCode', d_name, top_n_filter, show_others_toggle, chart_metric, desc_map=desc_lookup, is_master=True)
+                            fig_m.update_layout(height=400, showlegend=False)
+                            st.plotly_chart(fig_m, use_container_width=True)
+
+    with tab_map["🔍 Fault Analysis"]:
         st.subheader(f"Fault Analysis: {sel_device}")
         f1_full = get_metrics_master(df, w1_dates, sel_types, sel_device, ['EventCode', 'EventDescription'], global_cycles_val=w1_total_cycles)
         if not enable_comp:
             f1 = f1_full.sort_values('EventCount', ascending=False).head(10) if not f1_full.empty else pd.DataFrame()
             cl, cr = st.columns([1, 1.2])
-            with cl: st.plotly_chart(px.bar(f1, x='EventCode', y='EventCount', title="Top 10 Faults").update_layout(yaxis_title="Count of Event Code"), use_container_width=True)
+            with cl: st.plotly_chart(px.bar(f1, x='EventCode', y='EventCount' if chart_metric == "Count" else 'DurationTotal', title=f"Top 10 Faults").update_layout(yaxis_title="Count" if chart_metric == "Count" else "Duration"), use_container_width=True)
             with cr:
                 st.markdown("### Top 10 Fault Details")
                 if not f1.empty:
@@ -259,8 +297,7 @@ if st.session_state.raw_data is not None:
             f1_chart = get_metrics_master(df, w1_dates, sel_types, sel_device, ['EventCode', 'DeviceName'], global_cycles_val=w1_total_cycles)
             f2_chart = get_metrics_master(df, w2_dates, sel_types, sel_device, ['EventCode', 'DeviceName'], global_cycles_val=w2_total_cycles)
             u_codes = list(set(f1_full.sort_values('EventCount', ascending=False).head(10)['EventCode'].tolist() if not f1_full.empty else []) | set(get_metrics_master(df, w2_dates, sel_types, sel_device, ['EventCode']).sort_values('EventCount', ascending=False).head(10)['EventCode'].tolist() if enable_comp else []))
-            st.plotly_chart(create_cluster_stack(f1_chart[f1_chart['EventCode'].isin(u_codes)], f2_chart[f2_chart['EventCode'].isin(u_codes)], 'EventCode', 'DeviceName', "Fault Comparison", top_n_filter, show_others_toggle), use_container_width=True)
-            
+            st.plotly_chart(create_cluster_stack(f1_chart[f1_chart['EventCode'].isin(u_codes)], f2_chart[f2_chart['EventCode'].isin(u_codes)], 'EventCode', 'DeviceName', f"Fault Comparison", top_n_filter, show_others_toggle, chart_metric), use_container_width=True)
             st.markdown("### Row 2: Fault Delta Analysis")
             f1_tab = get_metrics_master(df, w1_dates, sel_types, sel_device, ['EventCode', 'EventDescription'], global_cycles_val=w1_total_cycles)
             f2_tab = get_metrics_master(df, w2_dates, sel_types, sel_device, ['EventCode', 'EventDescription'], global_cycles_val=w2_total_cycles)
@@ -270,7 +307,6 @@ if st.session_state.raw_data is not None:
             f_comp['Delta Count'] = f_comp['EventCount_W2'] - f_comp['EventCount_W1']
             f_comp['Delta DT (Hrs)'] = ((f_comp['DurationTotal_W2'] - f_comp['DurationTotal_W1']) / 3600).round(2)
             f_comp['DT_W1'], f_comp['DT_W2'], f_comp['Action'] = f_comp['DurationTotal_W1'].apply(format_dhm), f_comp['DurationTotal_W2'].apply(format_dhm), "🔍 View Logs"
-            # REQUIREMENT: REMOVE REQUESTED COLUMNS
             f_cols = ['Action', 'EventCode', 'EventCount_W1', 'EventCount_W2', 'Delta Count', 'DT_W1', 'DT_W2', 'Delta DT (Hrs)', 'EventDescription']
             t2_sel_c = st.dataframe(f_comp[f_cols].style.map(color_delta, subset=['Delta Count', 'Delta DT (Hrs)']).format({'Delta DT (Hrs)': '{:.2f}'}), use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key=f"t2_c_{st.session_state.tk_fault}")
             if t2_sel_c and t2_sel_c.get('selection') and t2_sel_c['selection'].get('rows'):
@@ -279,13 +315,7 @@ if st.session_state.raw_data is not None:
         st.divider()
         st.subheader("Trend Analysis")
         freq_map = {'Daily': 'D', 'Weekly': 'W', 'Monthly': 'ME'}; drill = freq_map[st.selectbox("Trend Frequency:", list(freq_map.keys()))]
-        ui_l, ui_r = st.columns(2)
-        with ui_l:
-            s1, s2 = st.columns([2, 1])
-            with s1: opts = ["All"] + sorted(u_codes if enable_comp else f1_full['EventCode'].unique().tolist()); st.session_state.trend_event_code = st.selectbox("Trend Filter", opts, index=opts.index(st.session_state.trend_event_code) if st.session_state.trend_event_code in opts else 0)
-            with s2: tm = st.radio("Trend Metric:", ["Counts", "Fault%"])
-        with ui_r: du = st.radio("Trend Unit:", ["Minutes", "Seconds"])
-        def get_trend_data(dr, code, s_dev, types_filter):
+        def get_trend_data(dr, code, s_dev, types_filter, t_unit):
             if len(dr) < 2: return pd.DataFrame()
             mask = (df['EventDate'].dt.date >= dr[0]) & (df['EventDate'].dt.date <= dr[1])
             t_sub = df.loc[mask]
@@ -295,47 +325,37 @@ if st.session_state.raw_data is not None:
             if code != "All": t_sub = t_sub[t_sub['EventCode'] == code]
             tr = t_sub.set_index('EventDate').groupby([pd.Grouper(freq=drill), 'EventType']).agg({'EventCode':'count', 'Duration':'sum'}).reset_index()
             tr = pd.merge(tr, p_cyc, on='EventDate', how='left').fillna(0)
-            tr['Plot'] = (tr['EventCode'] / tr['CP'].replace(0, 1) * 100).round(2) if tm == "Fault%" else tr['EventCode']
-            tr['D_Plot'] = tr['Duration'] / (60 if du == "Minutes" else 1)
+            tr['Plot'] = tr['EventCode'] if chart_metric == "Count" else tr['Duration']/60
+            tr['D_Plot'] = tr['Duration'] / (60 if t_unit == "Minutes" else 1)
             return tr
-        tr1 = get_trend_data(w1_dates, st.session_state.trend_event_code, sel_device, sel_types)
+        
+        tr1 = get_trend_data(w1_dates, st.session_state.trend_event_code, sel_device, sel_types, trend_unit_val)
         tc1, tc2, tc3, tc4 = st.columns(4)
-        with tc1: st.plotly_chart(px.line(tr1, x='EventDate', y='Plot', color='EventType', title=f"W1 {tm}", markers=True).update_layout(yaxis_title="Count of Event Code"), use_container_width=True)
-        with tc3: st.plotly_chart(px.line(tr1, x='EventDate', y='D_Plot', color='EventType', title=f"W1 DT ({du})", markers=True), use_container_width=True)
+        with tc1: st.plotly_chart(px.line(tr1, x='EventDate', y='Plot', color='EventType', title=f"W1 {chart_metric}", markers=True).update_layout(yaxis_title=chart_metric), use_container_width=True)
+        with tc3: st.plotly_chart(px.line(tr1, x='EventDate', y='D_Plot', color='EventType', title=f"W1 Downtime", markers=True), use_container_width=True)
         if enable_comp:
-            tr2 = get_trend_data(w2_dates, st.session_state.trend_event_code, sel_device, sel_types)
-            with tc2: st.plotly_chart(px.line(tr2, x='EventDate', y='Plot', color='EventType', title=f"W2 {tm}", markers=True).update_layout(yaxis_title="Count of Event Code"), use_container_width=True)
-            with tc4: st.plotly_chart(px.line(tr2, x='EventDate', y='D_Plot', color='EventType', title=f"W2 DT ({du})", markers=True), use_container_width=True)
+            tr2 = get_trend_data(w2_dates, st.session_state.trend_event_code, sel_device, sel_types, trend_unit_val)
+            with tc2: st.plotly_chart(px.line(tr2, x='EventDate', y='Plot', color='EventType', title=f"W2 {chart_metric}", markers=True).update_layout(yaxis_title=chart_metric), use_container_width=True)
+            with tc4: st.plotly_chart(px.line(tr2, x='EventDate', y='D_Plot', color='EventType', title=f"W2 Downtime", markers=True), use_container_width=True)
 
-    with t3:
+    with tab_map["🛠️ Tech Log"]:
         st.subheader("Technician Log Management")
-        with st.form("tech_entry", clear_on_submit=True):
-            f_dev = st.selectbox("Machine", sorted(df['DeviceName'].unique())); f_code = st.selectbox("Code", sorted(df[df['DeviceName'] == f_dev]['EventCode'].unique())); f_tech, f_act, f_dt = st.text_input("Tech"), st.text_area("Action"), st.date_input("Date", datetime.now())
-            if st.form_submit_button("Save"): conn.cursor().execute("INSERT INTO notes (DeviceName, EventCode, TechnicianName, CorrectiveAction, ActionDate) VALUES (?,?,?,?,?)", (f_dev, f_code, f_tech, f_act, str(f_dt))); conn.commit(); st.success("Log Saved.")
         logs_raw = pd.read_sql_query("SELECT * FROM notes", conn)
-        if not logs_raw.empty:
-            def machine_sep(df_in):
-                styles = pd.DataFrame('', index=df_in.index, columns=df_in.columns); prev = None
-                for i, machine in enumerate(df_in['DeviceName']):
-                    if prev is not None and machine != prev: styles.iloc[i, :] = 'background-color: #deeaf7; border-top: 5px solid #31333F; font-weight: bold;'
-                    prev = machine
-                return styles
-            st.dataframe(logs_raw.sort_values(by=['DeviceName', 'EventCode']).style.apply(machine_sep, axis=None), use_container_width=True, hide_index=True)
+        def machine_sep(df_in):
+            styles = pd.DataFrame('', index=df_in.index, columns=df_in.columns); prev = None
+            for i, machine in enumerate(df_in['DeviceName']):
+                if prev is not None and machine != prev: styles.iloc[i, :] = 'background-color: #deeaf7; border-top: 4px solid #31333F; font-weight: bold;'
+                prev = machine
+            return styles
+        st.dataframe(logs_raw.sort_values(by=['DeviceName', 'EventCode']).style.apply(machine_sep, axis=None), use_container_width=True, hide_index=True)
 
-    with t4:
+    with tab_map["📄 Export Reports"]:
         st.subheader("PDF Export")
-        if st.button("🚀 Download Full Colored PDF Report"):
+        if st.button("🚀 Download Full Colored PDF"):
             with st.spinner("Processing PDF..."):
                 pdf = FPDF(); ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
-                def add_chart(pdf_obj, fig_obj, width=175):
-                    fig_obj.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                        pio.write_image(fig_obj, tmp.name, format="png", width=1200, height=600, scale=2)
-                        pdf_obj.image(tmp.name, x=15, w=width)
-                    if os.path.exists(tmp.name): os.remove(tmp.name)
                 pdf.add_page(); pdf.set_font("Arial", 'B', 20); pdf.cell(190, 15, "Production Analytics Report", 0, 1, 'C')
                 pdf.set_font("Arial", 'B', 11); pdf.cell(190, 8, f"Time Windows: {tw_str}", 0, 1, 'C'); pdf.ln(10)
-                pdf.set_font("Arial", 'B', 12); pdf.cell(190, 10, "1. Summary Data", 0, 1, 'L')
                 pdf_t = comp_df[main_cols] if enable_comp else met1_tab; cols_p = pdf_t.columns[1:11]
                 pdf.set_font("Arial", 'B', 7); [pdf.cell(19, 8, str(c)[:11], 1, 0, 'C') for c in cols_p]; pdf.ln()
                 pdf.set_font("Arial", '', 6)
@@ -343,7 +363,7 @@ if st.session_state.raw_data is not None:
                     for c in cols_p: pdf.cell(19, 7, str(r_pdf[c]).encode('latin-1', 'ignore').decode('latin-1')[:15], 1, 0, 'C')
                     pdf.ln()
                 p_out = pdf.output(dest='S').encode('latin-1'); b64 = base64.b64encode(p_out).decode(); fname = f"Report_{ts}.pdf"
-                st.markdown(f'<a href="data:application/pdf;base64,{b64}" download="{fname}" style="padding:12px; background-color:#28a745; color:white; border-radius:8px; text-decoration:none; font-weight:bold;">📥 Download PDF Report</a>', unsafe_allow_html=True)
+                st.markdown(f'<a href="data:application/pdf;base64,{b64}" download="{fname}" style="padding:12px; background-color:#28a745; color:white; border-radius:8px; text-decoration:none; font-weight:bold;">📥 Download Report</a>', unsafe_allow_html=True)
 
     if st.session_state.dialog_trigger:
         pdia = st.session_state.dialog_trigger; st.session_state.dialog_trigger = None
