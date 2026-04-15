@@ -1,2 +1,10 @@
-plotly
 streamlit
+pandas
+plotly
+sqlite3
+FPDF
+base64
+re
+io
+tempfile
+os
