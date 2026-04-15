@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 import plotly.io as pio
 import sqlite3
 from datetime import datetime
-from fpdf import FPDF
+#from fpdf import FPDF
 import base64
 import re
 import io
