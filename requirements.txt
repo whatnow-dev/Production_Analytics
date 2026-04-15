@@ -2,3 +2,4 @@ streamlit
 pandas
 plotly
 sqlite3
+fpdf
