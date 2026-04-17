@@ -1,16 +1,16 @@
 # ==============================================================================
 # 1. CORE LIBRARIES
 # ==============================================================================
-import streamlit as st 
-import pandas as pd     
-import plotly.express as px  
-import plotly.graph_objects as go  
-import plotly.io as pio  
-import sqlite3          
+import streamlit as st
+import pandas as pd    
+import plotly.express as px 
+import plotly.graph_objects as go 
+import plotly.io as pio 
+import sqlite3         
 from datetime import datetime, time, timedelta
-import base64           
-import re               
-import io               # For in-memory file handling (Excel/HTML)
+import base64          
+import re              
+import io              
 
 # ==============================================================================
 # 2. SYSTEM CONFIGURATION & MEMORY
@@ -27,8 +27,8 @@ if 'dialog_trigger' not in st.session_state: st.session_state.dialog_trigger = N
 def init_database():
     conn = sqlite3.connect('maintenance_data.db', check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS notes 
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, DeviceName TEXT, 
+    cursor.execute('''CREATE TABLE IF NOT EXISTS notes
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, DeviceName TEXT,
                       EventCode TEXT, TechnicianName TEXT, CorrectiveAction TEXT, ActionDate TEXT)''')
     conn.commit()
     return conn
@@ -53,14 +53,13 @@ def format_seconds_to_clock(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def clean_duration_literal(series):
-    """Literal duration cleaner. Caps at 24h to prevent date-to-number errors."""
     def parse_one(x):
         try:
             x_str = str(x).strip().lower()
             if ':' in x_str:
                 p = x_str.split(':')
                 val = int(p[0])*3600 + int(p[1])*60 + float(p[2]) if len(p)==3 else int(p[0])*60 + float(p[1])
-            else: 
+            else:
                 val = float(re.sub(r'[^0-9.]', '', x_str))
                 if 0 < val < 1.0: val = val * 86400.0
             return val if 0 <= val <= 86400.0 else 0.0
@@ -86,7 +85,7 @@ def process_upload(file):
 def get_metrics_calculation(source_df, start_dt, end_dt, types, device, group_cols, global_cycles=None, break_window=None):
     active = source_df[(source_df['EventDate'] >= start_dt) & (source_df['EventDate'] <= end_dt)].copy()
     if break_window and break_window[0] != break_window[1]:
-        active = active[~((active['EventDate'].dt.time >= break_window[0]) & 
+        active = active[~((active['EventDate'].dt.time >= break_window[0]) &
                           (active['EventDate'].dt.time <= break_window[1]))]
 
     if device != "All": active = active[active['DeviceName'] == device]
@@ -95,10 +94,10 @@ def get_metrics_calculation(source_df, start_dt, end_dt, types, device, group_co
     v_cyc = active[active['SystemCounter'] > 0]
     cycles_by_m = v_cyc.groupby('DeviceName')['SystemCounter'].agg(lambda x: int(max(0, x.max() - x.min()))).reset_index(name='Cycles')
     events = active[active['EventType'].isin(types)]
-    
+   
     if events.empty:
         res = cycles_by_m.copy()
-        for col in group_cols: 
+        for col in group_cols:
             if col not in res.columns: res[col] = "N/A"
         res['Count'], res['Duration'] = 0, 0.0
     else:
@@ -111,23 +110,27 @@ def get_metrics_calculation(source_df, start_dt, end_dt, types, device, group_co
         if 'DeviceName' in group_cols: res = pd.merge(agg, cycles_by_m, on='DeviceName', how='left').fillna(0)
         else:
             res = agg.copy(); res['Cycles'] = global_cycles if global_cycles is not None else cycles_by_m['Cycles'].sum()
-            
+           
     res['Fault%'] = (res['Count'] / res['Cycles'].replace(0, 1) * 100).round(2)
     return res
 
 # ==============================================================================
-# 4. CHART ENGINE (Machine Analysis terminology)
+# 4. CHART ENGINE (Option A: Total Minutes Axis)
 # ==============================================================================
 
 def create_cluster_stack_chart(df_w1, df_w2, x_col, stack_col, title, top_n, show_others, metric, desc_map=None, is_gallery=False):
     fig = go.Figure()
     val_col = 'Count' if metric == "Count" else 'Duration'
+   
+    # REQ: Option A - Explicitly label Y-axis as Total Minutes
+    y_axis_label = "Total Occurrences" if metric == "Count" else "Total Minutes"
+   
     w1_palette = ['#082245','#08306B','#08519C','#2171B5','#4292C6']
     w2_palette = ['#67000D','#A50F15','#CB181D','#EF3B2C','#FB6A4A']
-    
+   
     def process_ranking(df_in):
         if df_in.empty: return df_in
-        limit = 5 
+        limit = 5
         df_rank = df_in.copy()
         df_rank['rank'] = df_rank.groupby(x_col)[val_col].rank(method='first', ascending=False)
         if show_others:
@@ -143,16 +146,24 @@ def create_cluster_stack_chart(df_w1, df_w2, x_col, stack_col, title, top_n, sho
         if show_others and "Others" in df[stack_col].unique(): cats.append("Others")
         for i, category in enumerate(cats):
             sub = df[df[stack_col] == category]
+           
+            # REQ: Plot as raw numbers (Minutes) for Option A
             y_data = sub[val_col] if metric == "Count" else sub[val_col] / 60
+           
             color = "#D3D3D3" if category == "Others" else colors[i % len(colors)]
             leg_name = f"{label_prefix}: {category}"
+           
+            # Tooltips still show hh:mm:ss for precision
             v_str = sub[val_col].apply(format_seconds_to_clock) if metric == "Duration" else sub[val_col].astype(str)
             tip = f"<b>{label_prefix}</b><br>Code: {category}<br>{metric}: {v_str.iloc[0]}<extra></extra>"
+           
             fig.add_trace(go.Bar(name=leg_name, x=sub[x_col], y=y_data, offsetgroup=offset, marker=dict(color=color, line=dict(color='white', width=0.5)), legendgroup=label_prefix, hovertemplate=tip))
 
     add_bars(c_w1, "W1", 0, w1_palette)
     add_bars(c_w2, "W2", 1, w2_palette)
-    fig.update_layout(title=title, barmode='stack', yaxis_title=metric, bargap=0.15, bargroupgap=0.1)
+   
+    # REQ: Standard numeric axis title for Option A
+    fig.update_layout(title=title, barmode='stack', yaxis_title=y_axis_label, bargap=0.15, bargroupgap=0.1)
     return fig
 
 # ==============================================================================
@@ -193,7 +204,7 @@ if upl:
     if ignore_codes: m_df = raw_df_full[~raw_df_full['EventCode'].isin(ignore_codes)]
     else: m_df = raw_df_full
     desc_lookup = m_df.groupby('EventCode')['EventDescription'].first().to_dict()
-    
+   
     st.sidebar.divider()
     st.sidebar.header("Navigation & Metrics")
     s_dev = st.sidebar.selectbox("Active Machine View", ["All"] + sorted(m_df['DeviceName'].unique().tolist()))
@@ -203,7 +214,7 @@ if upl:
     s_oth = st.sidebar.checkbox("Include 'Others' Group", True)
     s_mas = st.sidebar.checkbox("Generate Machine gallery Tab", False)
     s_unt = st.sidebar.radio("Trend Unit (Downtime):", ["Minutes", "Seconds"], key="unit_sidebar")
-    
+   
     st.sidebar.divider(); st.sidebar.header("🕒 Precision Timing")
     brk_c1, brk_c2 = st.sidebar.columns(2)
     brk_start = brk_c1.time_input("Break Start", time(12, 0))
@@ -231,7 +242,7 @@ if upl:
         w1_start_dt = datetime.combine(w1_dates[0], w1_start_t)
         w1_end_dt = datetime.combine(w1_dates[1], w1_end_t)
         met1_dev_only = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['DeviceName'], break_window=(brk_start, brk_end))
-        
+       
         if not comp_on:
             f_pie = px.pie(met1_dev_only, names='DeviceName', values='Count' if s_met=="Count" else 'Duration', hole=0.4, title="Machine Impact Distribution", hover_data=['EventDescription'])
             f_hyb = None
@@ -240,7 +251,6 @@ if upl:
             m2_c = get_metrics_calculation(m_df, w2_start_dt, w2_end_dt, s_typ, s_dev, ['DeviceName', 'EventCode'], break_window=(brk_start, brk_end)) if comp_on else pd.DataFrame()
             f_hyb = create_cluster_stack_chart(m1_c, m2_c, 'DeviceName', 'EventCode', "Machine Analysis (W1 vs W2)", s_top, s_oth, s_met, desc_map=desc_lookup)
 
-        # Tab Navigation
         tabs = st.tabs(["🏠 Dashboard", "🔍 Fault Analysis", "🛠️ Tech Log", "📄 Multi-Format Export"] + (["📊 Machine gallery"] if s_mas else []))
         t_map = {name: tabs[i] for i, name in enumerate(["🏠 Dashboard", "🔍 Fault Analysis", "🛠️ Tech Log", "📄 Multi-Format Export"] + (["📊 Machine gallery"] if s_mas else []))}
 
@@ -277,7 +287,10 @@ if upl:
             f1_full_data = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['EventCode', 'EventDescription'], break_window=(brk_start, brk_end))
             if not comp_on:
                 f10 = f1_full_data.sort_values('Count', ascending=False).head(10) if not f1_full_data.empty else pd.DataFrame()
-                st.plotly_chart(px.bar(f10, x='EventCode', y='Count' if s_met=="Count" else 'Duration', title="Top 10 High-Impact Codes").update_layout(yaxis_title=s_met), use_container_width=True)
+                # REQ: Axis Title updated to Minutes logic
+                y_ax_label = "Total Occurrences" if s_met == "Count" else "Total Minutes"
+                fig_fb = px.bar(f10, x='EventCode', y='Count' if s_met=="Count" else f10['Duration']/60, title="Top 10 High-Impact Codes").update_layout(yaxis_title=y_ax_label)
+                st.plotly_chart(fig_fb, use_container_width=True)
                 f10['Action'], f10['Downtime'] = "🔍 View Logs", f10['Duration'].apply(format_seconds_to_clock)
                 grid_f = st.dataframe(f10[['Action', 'EventCode', 'Count', 'Downtime', 'EventDescription']], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key=f"gf1_{st.session_state.tk_fault}")
                 if grid_f and grid_f.get('selection') and grid_f['selection'].get('rows'): st.session_state.dialog_trigger = {'m': s_dev, 'c': f10.iloc[grid_f['selection']['rows'][0]]['EventCode'], 't': 'fault'}
@@ -309,11 +322,11 @@ if upl:
                 return tr
             t1 = get_tr(w1_start_dt, w1_end_dt, st.session_state.trend_event_code, s_dev, s_typ, s_unt, (brk_start, brk_end)); tc = st.columns(4)
             tc[0].plotly_chart(px.line(t1, x='EventDate', y='P', color='EventType', markers=True, title="W1 Trend"), use_container_width=True)
-            tc[2].plotly_chart(px.line(t1, x='EventDate', y='D', color='EventType', markers=True, title="W1 Downtime"), use_container_width=True)
+            tc[2].plotly_chart(px.line(t1, x='EventDate', y='D', color='EventType', markers=True, title="W1 Downtime (Minutes)"), use_container_width=True)
             if comp_on and w2_start_dt:
                 t2 = get_tr(w2_start_dt, w2_end_dt, st.session_state.trend_event_code, s_dev, s_typ, s_unt, (brk_start, brk_end))
                 tc[1].plotly_chart(px.line(t2, x='EventDate', y='P', color='EventType', markers=True, title="W2 Trend"), use_container_width=True)
-                tc[3].plotly_chart(px.line(t2, x='EventDate', y='D', color='EventType', markers=True, title="W2 Downtime"), use_container_width=True)
+                tc[3].plotly_chart(px.line(t2, x='EventDate', y='D', color='EventType', markers=True, title="W2 Downtime (Minutes)"), use_container_width=True)
 
         with t_map["🛠️ Tech Log"]:
             with st.expander("📝 Record New Maintenance Action", expanded=False):
@@ -335,71 +348,44 @@ if upl:
                     return s
                 st.dataframe(full_hist.style.apply(group_logic, axis=None), use_container_width=True, hide_index=True)
 
-        # ==============================================================================
-        # REFACTORED: MACHINE ANALYSIS EXPORT BUILDER
-        # ==============================================================================
         with t_map["📄 Multi-Format Export"]:
             st.subheader("Machine Analysis Report Builder")
             e1, e2 = st.columns(2)
-            
             with e1:
                 st.markdown("### 🌐 Interactive HTML Report")
-                html_items = st.multiselect("Pick HTML Content:", 
-                                         ["Date Window Headers", "KPI Comparison Summary", "Machine Analysis Chart", "Machine Performance Table", "Technician History Log"],
-                                         default=["Date Window Headers", "KPI Comparison Summary", "Machine Analysis Chart"])
+                html_items = st.multiselect("Pick HTML Content:", ["Date Window Headers", "KPI Comparison Summary", "Machine Analysis Chart", "Machine Performance Table", "Technician History Log"], default=["Date Window Headers", "KPI Comparison Summary", "Machine Analysis Chart"])
                 if st.button("🚀 Generate HTML Machine Report"):
                     html_buffer = io.StringIO()
-                    html_buffer.write("<html><head><style>body{font-family:sans-serif; padding:40px;} .card{border:1px solid #ddd; padding:20px; margin-bottom:20px; border-radius:8px;}</style></head><body>")
-                    html_buffer.write("<h1>Production Line Machine Analysis</h1><hr>")
-                    
+                    html_buffer.write("<html><head><style>body{font-family:sans-serif; padding:40px;} .card{border:1px solid #ddd; padding:20px; margin-bottom:20px; border-radius:8px;}</style></head><body><h1>Production Line Machine Analysis</h1><hr>")
                     if "Date Window Headers" in html_items:
                         html_buffer.write(f"<div class='card'><h3>Analysis Periods</h3><p><b>Window 1:</b> {w1_start_dt} to {w1_end_dt}</p>")
                         if comp_on: html_buffer.write(f"<p><b>Window 2:</b> {w2_start_dt} to {w2_end_dt}</p>")
                         html_buffer.write("</div>")
-                        
                     if "KPI Comparison Summary" in html_items:
                         html_buffer.write("<div class='card'><h3>KPI Summary</h3>")
                         html_buffer.write(f"<p>W1 Events: {int(met1_dev_only['Count'].sum())} | W1 Downtime: {format_seconds_to_clock(met1_dev_only['Duration'].sum())}</p>")
                         if comp_on: html_buffer.write(f"<p>W2 Events: {int(met2_dev_only['Count'].sum())} | W2 Downtime: {format_seconds_to_clock(met2_dev_only['Duration'].sum())}</p>")
                         html_buffer.write("</div>")
-                        
                     if "Machine Analysis Chart" in html_items:
                         chart_to_use = f_hyb if comp_on else f_pie
-                        if chart_to_use:
-                            html_buffer.write(f"<div class='card'><h3>Production Analysis Visual</h3>{chart_to_use.to_html(full_html=False, include_plotlyjs='cdn')}</div>")
-                            
+                        if chart_to_use: html_buffer.write(f"<div class='card'><h3>Production Analysis Visual</h3>{chart_to_use.to_html(full_html=False, include_plotlyjs='cdn')}</div>")
                     if "Machine Performance Table" in html_items:
                         table_to_use = diff if comp_on else met1_dev_only
                         html_buffer.write(f"<div class='card'><h3>Performance Data</h3>{table_to_use.drop(columns=['Action']).to_html(index=False)}</div>")
-                    
                     if "Technician History Log" in html_items:
                         html_buffer.write(f"<div class='card'><h3>Maintenance Logs</h3>{full_hist.to_html(index=False)}</div>")
-                    
                     html_buffer.write("</body></html>")
                     st.download_button("📥 Download HTML Machine Report", data=html_buffer.getvalue(), file_name="Machine_Analysis_Report.html", mime="text/html")
-
             with e2:
                 st.markdown("### 📊 Multi-Sheet Excel Executive Summary")
                 if st.button("🚀 Generate Excel Machine Summary"):
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        # Metadata Header Sheet (Requirement: Time Windows at top)
-                        meta_df = pd.DataFrame({
-                            'Analysis Period': ['Window 1 Start', 'Window 1 End', 'Window 2 Start', 'Window 2 End'],
-                            'Timestamp': [str(w1_start_dt), str(w1_end_dt), str(w2_start_dt) if comp_on else "N/A", str(w2_end_dt) if comp_on else "N/A"]
-                        })
-                        meta_df.to_excel(writer, sheet_name='Executive Summary', index=False)
-                        
-                        # Sheet 1: Executive Machine Table (W1 vs W2)
+                        pd.DataFrame({'Analysis Period': ['Window 1 Start', 'Window 1 End', 'Window 2 Start', 'Window 2 End'],'Timestamp': [str(w1_start_dt), str(w1_end_dt), str(w2_start_dt) if comp_on else "N/A", str(w2_end_dt) if comp_on else "N/A"]}).to_excel(writer, sheet_name='Executive Summary', index=False)
                         sheet1_data = diff.drop(columns=['Action']) if comp_on else met1_dev_only.drop(columns=['Action'])
                         sheet1_data.to_excel(writer, sheet_name='Executive Summary', startrow=6, index=False)
-                        
-                        # Sheet 2: Detailed Fault Rankings
                         f1_full_data.to_excel(writer, sheet_name='Fault Analysis', index=False)
-                        
-                        # Sheet 3: Tech Logs
                         full_hist.to_excel(writer, sheet_name='Technician Logs', index=False)
-                        
                     st.download_button("📥 Download Excel Machine Summary", data=output.getvalue(), file_name="Machine_Executive_Summary.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         if s_mas:
@@ -419,6 +405,5 @@ if upl:
         if st.session_state.dialog_trigger:
             d_p = st.session_state.dialog_trigger; st.session_state.dialog_trigger = None
             show_popup_logs(d_p['m'], d_p['c'], d_p['t'])
-    else:
-        st.warning("Please select valid date ranges for both time windows.")
+    else: st.warning("Please select valid date ranges for both time windows.")
 else: st.info("👋 Welcome. Please upload machine production data in the sidebar.")
