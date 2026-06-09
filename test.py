@@ -23,6 +23,7 @@ if 'trend_event_code' not in st.session_state: st.session_state.trend_event_code
 if 'tk_main' not in st.session_state: st.session_state.tk_main = 0
 if 'tk_fault' not in st.session_state: st.session_state.tk_fault = 100
 if 'dialog_trigger' not in st.session_state: st.session_state.dialog_trigger = None
+if 'selected_dashboard_machine' not in st.session_state: st.session_state.selected_dashboard_machine = None
 
 def init_database():
     conn = sqlite3.connect('maintenance_data.db', check_same_thread=False)
@@ -254,6 +255,15 @@ if upl:
         
         met1_dev_only = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['DeviceName'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
         
+        f_hyb = None 
+        
+        if not comp_on:
+            f_pie = px.pie(met1_dev_only, names='DeviceName', values='Count' if s_met=="Count" else 'Duration', hole=0.4, title="Machine Impact Distribution", hover_data=['EventDescription'])
+        else:
+            m1_c = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['DeviceName', 'EventCode'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
+            m2_c = get_metrics_calculation(m_df, w2_start_dt, w2_end_dt, s_typ, s_dev, ['DeviceName', 'EventCode'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets) if comp_on else pd.DataFrame()
+            f_hyb = create_cluster_stack_chart(m1_c, m2_c, 'DeviceName', 'EventCode', "Machine Analysis (W1 vs W2)", s_top, s_oth, s_met, desc_map=desc_lookup)
+
         tabs = st.tabs(["🏠 Dashboard", "🔍 Fault Analysis", "🛠️ Tech Log", "📄 Multi-Format Export"] + (["📊 Machine gallery"] if s_mas else []))
         t_map = {name: tabs[i] for i, name in enumerate(["🏠 Dashboard", "🔍 Fault Analysis", "🛠️ Tech Log", "📄 Multi-Format Export"] + (["📊 Machine gallery"] if s_mas else []))}
 
@@ -269,32 +279,24 @@ if upl:
 
                 l, r = st.columns([1, 1.2])
                 with r:
-                    # NEW FIX: Explicitly handle modal triggers via a checkbox toggle right above the master control dataframe
                     st.markdown("### 📋 Line Performance Summary")
                     view_logs_mode = st.checkbox("🔍 Toggle 'View History Logs' Mode", value=False, help="When checked, selecting a machine row will immediately open its maintenance logs window.")
                     
-                    grid1 = st.dataframe(display_df[['DeviceName', 'Count', 'Total Downtime', 'Cycles', 'Fault%']].style.format({'Cycles': '{:,.0f}', 'Fault%': '{:.2f}%'}), use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key=f"g1_master_table_v99_{st.session_state.tk_main}")
+                    grid1 = st.dataframe(display_df[['DeviceName', 'Count', 'Total Downtime', 'Cycles', 'Fault%']].style.format({'Cycles': '{:,.0f}', 'Fault%': '{:.2f}%'}), use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key=f"g1_master_table_v100_{st.session_state.tk_main}")
                 
                 selected_machine = None
                 if grid1 and grid1.get('selection') and grid1['selection'].get('rows'):
                     selected_machine = display_df.iloc[grid1['selection']['rows'][0]]['DeviceName']
-                    
-                    # If 'View Logs Mode' checkbox is active, launch the dialog popup immediately on row click
                     if view_logs_mode:
                         st.session_state.dialog_trigger = {'m': selected_machine, 'c': "All", 't': 'main'}
 
-                # Initial default fallback loader targeting the absolute highest fault-count asset
                 if not selected_machine and not met1_dev_only.empty:
                     max_fault_row = met1_dev_only.sort_values(by='Count', ascending=False).iloc[0]
                     selected_machine = max_fault_row['DeviceName']
 
                 with l:
-                    f_pie = px.pie(met1_dev_only, names='DeviceName', values='Count' if s_met=="Count" else 'Duration', hole=0.4, title="Machine Impact Distribution", hover_data=['EventDescription'])
                     st.plotly_chart(f_pie, use_container_width=True, key="main_pie_distribution_static")
 
-                # ==============================================================================
-                # ROW 2 DEEP-DIVE ANALYSIS SCREEN
-                # ==============================================================================
                 if selected_machine:
                     st.divider()
                     st.subheader(f"🔍 Deep-Dive Machine Focus Analysis: {selected_machine}")
@@ -309,7 +311,7 @@ if upl:
                         bl, br = st.columns([1, 1.2])
                         with bl:
                             sub_pie = px.pie(machine_faults, names='EventCode', values='Count' if s_met == "Count" else 'Duration', hole=0.3, title=f"Top 10 Event Codes Impact for {selected_machine}", hover_data=['EventDescription'])
-                            st.plotly_chart(sub_pie, use_container_width=True, key=f"sub_pie_visual_v99_{selected_machine}")
+                            st.plotly_chart(sub_pie, use_container_width=True, key=f"sub_pie_visual_v100_{selected_machine}")
                         with br:
                             st.markdown(f"**Top 10 Event Codes Profile Table Unique to {selected_machine}**")
                             st.dataframe(machine_faults[['EventCode', 'Count', 'Downtime', 'EventDescription']], use_container_width=True, hide_index=True)
@@ -323,14 +325,21 @@ if upl:
                 st.markdown(f"**Window 2 Metrics ({w2_start_dt})**"); c2 = st.columns(4)
                 m2 = met2_dev_only if s_dev=="All" else met2_dev_only[met2_dev_only['DeviceName']==s_dev]
                 c2[0].metric("Events", int(m2['Count'].sum())); c2[1].metric("Downtime", format_seconds_to_clock(m2['Duration'].sum())); c2[2].metric("Avg", f"{(m2['Duration'].sum()/max(1,m2['Count'].sum())):.1f}s"); c2[3].metric("Active", m2[m2['Count']>0]['DeviceName'].nunique())
-                st.plotly_chart(f_hyb, use_container_width=True)
+                
+                if f_hyb is not None:
+                    st.plotly_chart(f_hyb, use_container_width=True)
+                    
                 diff = pd.merge(met1_dev_only, met2_dev_only, on='DeviceName', how='outer', suffixes=('_w1', '_w2')).fillna(0)
                 for c in ['Count_w1', 'Count_w2', 'Cycles_w1', 'Cycles_w2']: diff[c] = diff[c].astype(int)
                 diff['Delta Count'] = diff['Count_w2'] - diff['Count_w1']
                 diff['Delta DT (Hrs)'] = ((diff['Duration_w2'] - diff['Duration_w1']) / 3600).round(2)
                 diff['Duration_w1'], diff['Duration_w2'] = diff['Duration_w1'].apply(format_seconds_to_clock), diff['Duration_w2'].apply(format_seconds_to_clock)
                 grid_c = st.dataframe(diff[['DeviceName', 'Count_w1', 'Count_w2', 'Delta Count', 'Duration_w1', 'Duration_w2', 'Delta DT (Hrs)', 'Cycles_w1', 'Cycles_w2', 'Fault%_w1', 'Fault%_w2']].style.map(color_delta_styling, subset=['Delta Count', 'Delta DT (Hrs)']).format({'Delta DT (Hrs)': '{:.2f}', 'Fault%_w1': '{:.2f}%', 'Fault%_w2': '{:.2f}%'}), use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key=f"gc_{st.session_state.tk_main}")
-                if grid_c and grid_c.get('selection') and grid_c['selection'].get('rows'): st.session_state.dialog_trigger = {'m': diff.iloc[grid_c['selection']['rows'][0]]['DeviceName'], 'c': "All", 't': 'main'}
+                
+                view_logs_mode_comp = st.checkbox("🔍 Toggle 'View History Logs' Mode", value=False, key="comp_logs_checkbox")
+                if grid_c and grid_c.get('selection') and grid_c['selection'].get('rows'):
+                    if view_logs_mode_comp:
+                        st.session_state.dialog_trigger = {'m': diff.iloc[grid_c['selection']['rows'][0]]['DeviceName'], 'c': "All", 't': 'main'}
 
         with t_map["🔍 Fault Analysis"]:
             f1_full_data = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['EventCode', 'EventDescription'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
@@ -429,11 +438,11 @@ if upl:
                         if comp_on: html_buffer.write(f"<p>W2 Events: {int(met2_dev_only['Count'].sum())} | W2 Downtime: {format_seconds_to_clock(met2_dev_only['Duration'].sum())}</p>")
                         html_buffer.write("</div>")
                     if "Machine Analysis Chart" in html_items:
-                        chart_to_use = f_hyb if comp_on else f_pie
+                        chart_to_use = f_hyb if comp_on and f_hyb is not None else f_pie
                         if chart_to_use: html_buffer.write(f"<div class='card'><h3>Production Analysis Visual</h3>{chart_to_use.to_html(full_html=False, include_plotlyjs='cdn')}</div>")
                     if "Machine Performance Table" in html_items:
                         table_to_use = diff if comp_on else met1_dev_only
-                        html_buffer.write(f"<div class='card'><h3>Performance Data</h3>{table_to_use.to_html(index=False)}</div>")
+                        html_buffer.write(f"<div class='card'><h3>Performance Data</h3>{table_to_use.drop(columns=['Action'], errors='ignore').to_html(index=False)}</div>")
                     if "Technician History Log" in html_items:
                         html_buffer.write(f"<div class='card'><h3>Maintenance Logs</h3>{full_hist.to_html(index=False)}</div>")
                     html_buffer.write("</body></html>")
@@ -444,7 +453,7 @@ if upl:
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
                         pd.DataFrame({'Analysis Period': ['Window 1 Start', 'Window 1 End', 'Window 2 Start', 'Window 2 End'],'Timestamp': [str(w1_start_dt), str(w1_end_dt), str(w2_start_dt) if comp_on else "N/A", str(w2_end_dt) if comp_on else "N/A"]}).to_excel(writer, sheet_name='Executive Summary', index=False)
-                        sheet1_data = diff if comp_on else met1_dev_only
+                        sheet1_data = diff.drop(columns=['Action'], errors='ignore') if comp_on else met1_dev_only.drop(columns=['Action'], errors='ignore')
                         sheet1_data.to_excel(writer, sheet_name='Executive Summary', startrow=6, index=False)
                         f1_full_data.to_excel(writer, sheet_name='Fault Analysis', index=False)
                         full_hist.to_excel(writer, sheet_name='Technician Logs', index=False)
