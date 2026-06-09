@@ -1,16 +1,16 @@
 # ==============================================================================
 # 1. CORE LIBRARIES
 # ==============================================================================
-import streamlit as st
-import pandas as pd    
-import plotly.express as px 
-import plotly.graph_objects as go 
-import plotly.io as pio 
-import sqlite3         
+import streamlit as st 
+import pandas as pd     
+import plotly.express as px  
+import plotly.graph_objects as go  
+import plotly.io as pio  
+import sqlite3          
 from datetime import datetime, time, timedelta
-import base64          
-import re              
-import io              
+import base64           
+import re               
+import io               
 
 # ==============================================================================
 # 2. SYSTEM CONFIGURATION & MEMORY
@@ -27,8 +27,8 @@ if 'dialog_trigger' not in st.session_state: st.session_state.dialog_trigger = N
 def init_database():
     conn = sqlite3.connect('maintenance_data.db', check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS notes
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, DeviceName TEXT,
+    cursor.execute('''CREATE TABLE IF NOT EXISTS notes 
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, DeviceName TEXT, 
                       EventCode TEXT, TechnicianName TEXT, CorrectiveAction TEXT, ActionDate TEXT)''')
     conn.commit()
     return conn
@@ -59,7 +59,7 @@ def clean_duration_literal(series):
             if ':' in x_str:
                 p = x_str.split(':')
                 val = int(p[0])*3600 + int(p[1])*60 + float(p[2]) if len(p)==3 else int(p[0])*60 + float(p[1])
-            else:
+            else: 
                 val = float(re.sub(r'[^0-9.]', '', x_str))
                 if 0 < val < 1.0: val = val * 86400.0
             return val if 0 <= val <= 86400.0 else 0.0
@@ -82,10 +82,10 @@ def process_upload(file):
     clean['SystemCounter'] = pd.to_numeric(df[f(['counter'])], errors='coerce').fillna(0)
     return clean.dropna(subset=['EventDate'])
 
-def get_metrics_calculation(source_df, start_dt, end_dt, types, device, group_cols, global_cycles=None, break_window=None):
+def get_metrics_calculation(source_df, start_dt, end_dt, types, device, group_cols, global_cycles=None, break_window=None, ignore_resets=False):
     active = source_df[(source_df['EventDate'] >= start_dt) & (source_df['EventDate'] <= end_dt)].copy()
     if break_window and break_window[0] != break_window[1]:
-        active = active[~((active['EventDate'].dt.time >= break_window[0]) &
+        active = active[~((active['EventDate'].dt.time >= break_window[0]) & 
                           (active['EventDate'].dt.time <= break_window[1]))]
 
     if device != "All": active = active[active['DeviceName'] == device]
@@ -93,24 +93,51 @@ def get_metrics_calculation(source_df, start_dt, end_dt, types, device, group_co
 
     v_cyc = active[active['SystemCounter'] > 0]
     cycles_by_m = v_cyc.groupby('DeviceName')['SystemCounter'].agg(lambda x: int(max(0, x.max() - x.min()))).reset_index(name='Cycles')
-    events = active[active['EventType'].isin(types)]
-   
+    
+    events = active[active['EventType'].isin(types)].copy()
+    
     if events.empty:
         res = cycles_by_m.copy()
-        for col in group_cols:
+        for col in group_cols: 
             if col not in res.columns: res[col] = "N/A"
         res['Count'], res['Duration'] = 0, 0.0
     else:
-        agg = events.groupby(group_cols).agg(Count=('EventCode', 'count'), Duration=('Duration', 'sum')).reset_index()
-        window_secs = (end_dt - start_dt).total_seconds()
-        agg['Duration'] = agg['Duration'].clip(upper=window_secs)
-        if group_cols == ['DeviceName']:
-            dm = events.groupby('DeviceName')['EventDescription'].first().reset_index()
-            agg = pd.merge(agg, dm, on='DeviceName', how='left')
-        if 'DeviceName' in group_cols: res = pd.merge(agg, cycles_by_m, on='DeviceName', how='left').fillna(0)
+        # Global Reset Filters with Highest-Duration matching
+        if ignore_resets:
+            # Sort chronologically forward to properly identify sequential blocks
+            events = events.sort_values(by=['DeviceName', 'EventDate']).reset_index(drop=True)
+            events['SystemCounter'] = pd.to_numeric(events['SystemCounter'], errors='coerce').fillna(0)
+            
+            # Create a unique block identity for sequential stationary counter logs
+            events['counter_changed'] = (events['SystemCounter'] != events.groupby('DeviceName')['SystemCounter'].shift(1))
+            events['block_id'] = events.groupby('DeviceName')['counter_changed'].cumsum()
+            
+            # REQ RESOLUTION: Isolate the single HIGHEST duration value registered within this reset sequence block
+            max_block_duration = events.groupby(['DeviceName', 'block_id'])['Duration'].transform('max')
+            
+            # Identify the subsequent repeat rows to omit
+            is_consecutive_repetition = events.duplicated(subset=['DeviceName', 'block_id'], keep='first')
+            
+            # Reassign the max block value to the first chronological fault row, then clean out repeats
+            events['Duration'] = max_block_duration
+            events = events[~is_consecutive_repetition]
+
+        if events.empty:
+            res = cycles_by_m.copy()
+            for col in group_cols: 
+                if col not in res.columns: res[col] = "N/A"
+            res['Count'], res['Duration'] = 0, 0.0
         else:
-            res = agg.copy(); res['Cycles'] = global_cycles if global_cycles is not None else cycles_by_m['Cycles'].sum()
-           
+            agg = events.groupby(group_cols).agg(Count=('EventCode', 'count'), Duration=('Duration', 'sum')).reset_index()
+            window_secs = (end_dt - start_dt).total_seconds()
+            agg['Duration'] = agg['Duration'].clip(upper=window_secs)
+            if group_cols == ['DeviceName']:
+                dm = events.groupby('DeviceName')['EventDescription'].first().reset_index()
+                agg = pd.merge(agg, dm, on='DeviceName', how='left')
+            if 'DeviceName' in group_cols: res = pd.merge(agg, cycles_by_m, on='DeviceName', how='left').fillna(0)
+            else:
+                res = agg.copy(); res['Cycles'] = global_cycles if global_cycles is not None else cycles_by_m['Cycles'].sum()
+            
     res['Fault%'] = (res['Count'] / res['Cycles'].replace(0, 1) * 100).round(2)
     return res
 
@@ -121,16 +148,14 @@ def get_metrics_calculation(source_df, start_dt, end_dt, types, device, group_co
 def create_cluster_stack_chart(df_w1, df_w2, x_col, stack_col, title, top_n, show_others, metric, desc_map=None, is_gallery=False):
     fig = go.Figure()
     val_col = 'Count' if metric == "Count" else 'Duration'
-   
-    # REQ: Option A - Explicitly label Y-axis as Total Minutes
     y_axis_label = "Total Occurrences" if metric == "Count" else "Total Minutes"
-   
+    
     w1_palette = ['#082245','#08306B','#08519C','#2171B5','#4292C6']
     w2_palette = ['#67000D','#A50F15','#CB181D','#EF3B2C','#FB6A4A']
-   
+    
     def process_ranking(df_in):
         if df_in.empty: return df_in
-        limit = 5
+        limit = 5 
         df_rank = df_in.copy()
         df_rank['rank'] = df_rank.groupby(x_col)[val_col].rank(method='first', ascending=False)
         if show_others:
@@ -146,23 +171,15 @@ def create_cluster_stack_chart(df_w1, df_w2, x_col, stack_col, title, top_n, sho
         if show_others and "Others" in df[stack_col].unique(): cats.append("Others")
         for i, category in enumerate(cats):
             sub = df[df[stack_col] == category]
-           
-            # REQ: Plot as raw numbers (Minutes) for Option A
             y_data = sub[val_col] if metric == "Count" else sub[val_col] / 60
-           
             color = "#D3D3D3" if category == "Others" else colors[i % len(colors)]
             leg_name = f"{label_prefix}: {category}"
-           
-            # Tooltips still show hh:mm:ss for precision
             v_str = sub[val_col].apply(format_seconds_to_clock) if metric == "Duration" else sub[val_col].astype(str)
             tip = f"<b>{label_prefix}</b><br>Code: {category}<br>{metric}: {v_str.iloc[0]}<extra></extra>"
-           
             fig.add_trace(go.Bar(name=leg_name, x=sub[x_col], y=y_data, offsetgroup=offset, marker=dict(color=color, line=dict(color='white', width=0.5)), legendgroup=label_prefix, hovertemplate=tip))
 
     add_bars(c_w1, "W1", 0, w1_palette)
     add_bars(c_w2, "W2", 1, w2_palette)
-   
-    # REQ: Standard numeric axis title for Option A
     fig.update_layout(title=title, barmode='stack', yaxis_title=y_axis_label, bargap=0.15, bargroupgap=0.1)
     return fig
 
@@ -201,10 +218,13 @@ if upl:
     st.sidebar.markdown("### 🚫 Exclusion Filters")
     ignore_codes = st.sidebar.multiselect("⚠️ Ignore EventCodes (Global):", sorted(raw_df_full['EventCode'].unique().tolist()))
     ignore_devices_mas = st.sidebar.multiselect("⚠️ Hide Machines from gallery:", sorted(raw_df_full['DeviceName'].unique().tolist()))
+    
+    ignore_resets = st.sidebar.checkbox("🔄 Ignore Resets (HMI Duplicates)", value=False, help="Drops consecutive machine logs if the Part/Weld counter remains stationary.")
+
     if ignore_codes: m_df = raw_df_full[~raw_df_full['EventCode'].isin(ignore_codes)]
     else: m_df = raw_df_full
     desc_lookup = m_df.groupby('EventCode')['EventDescription'].first().to_dict()
-   
+    
     st.sidebar.divider()
     st.sidebar.header("Navigation & Metrics")
     s_dev = st.sidebar.selectbox("Active Machine View", ["All"] + sorted(m_df['DeviceName'].unique().tolist()))
@@ -214,7 +234,7 @@ if upl:
     s_oth = st.sidebar.checkbox("Include 'Others' Group", True)
     s_mas = st.sidebar.checkbox("Generate Machine gallery Tab", False)
     s_unt = st.sidebar.radio("Trend Unit (Downtime):", ["Minutes", "Seconds"], key="unit_sidebar")
-   
+    
     st.sidebar.divider(); st.sidebar.header("🕒 Precision Timing")
     brk_c1, brk_c2 = st.sidebar.columns(2)
     brk_start = brk_c1.time_input("Break Start", time(12, 0))
@@ -241,14 +261,15 @@ if upl:
     if len(w1_dates) == 2:
         w1_start_dt = datetime.combine(w1_dates[0], w1_start_t)
         w1_end_dt = datetime.combine(w1_dates[1], w1_end_t)
-        met1_dev_only = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['DeviceName'], break_window=(brk_start, brk_end))
-       
+        
+        met1_dev_only = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['DeviceName'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
+        
         if not comp_on:
             f_pie = px.pie(met1_dev_only, names='DeviceName', values='Count' if s_met=="Count" else 'Duration', hole=0.4, title="Machine Impact Distribution", hover_data=['EventDescription'])
             f_hyb = None
         else:
-            m1_c = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['DeviceName', 'EventCode'], break_window=(brk_start, brk_end))
-            m2_c = get_metrics_calculation(m_df, w2_start_dt, w2_end_dt, s_typ, s_dev, ['DeviceName', 'EventCode'], break_window=(brk_start, brk_end)) if comp_on else pd.DataFrame()
+            m1_c = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['DeviceName', 'EventCode'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
+            m2_c = get_metrics_calculation(m_df, w2_start_dt, w2_end_dt, s_typ, s_dev, ['DeviceName', 'EventCode'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets) if comp_on else pd.DataFrame()
             f_hyb = create_cluster_stack_chart(m1_c, m2_c, 'DeviceName', 'EventCode', "Machine Analysis (W1 vs W2)", s_top, s_oth, s_met, desc_map=desc_lookup)
 
         tabs = st.tabs(["🏠 Dashboard", "🔍 Fault Analysis", "🛠️ Tech Log", "📄 Multi-Format Export"] + (["📊 Machine gallery"] if s_mas else []))
@@ -267,7 +288,7 @@ if upl:
                     grid1 = st.dataframe(met1_dev_only[['Action', 'DeviceName', 'Count', 'Total Downtime', 'Cycles', 'Fault%']].style.format({'Cycles': '{:,.0f}', 'Fault%': '{:.2f}%'}), use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key=f"g1_{st.session_state.tk_main}")
                     if grid1 and grid1.get('selection') and grid1['selection'].get('rows'): st.session_state.dialog_trigger = {'m': met1_dev_only.iloc[grid1['selection']['rows'][0]]['DeviceName'], 'c': "All", 't': 'main'}
             else:
-                met2_dev_only = get_metrics_calculation(m_df, w2_start_dt, w2_end_dt, s_typ, s_dev, ['DeviceName'], break_window=(brk_start, brk_end))
+                met2_dev_only = get_metrics_calculation(m_df, w2_start_dt, w2_end_dt, s_typ, s_dev, ['DeviceName'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
                 st.markdown(f"**Window 1 Metrics ({w1_start_dt})**"); c1 = st.columns(4)
                 m1 = met1_dev_only if s_dev=="All" else met1_dev_only[met1_dev_only['DeviceName']==s_dev]
                 c1[0].metric("Events", int(m1['Count'].sum())); c1[1].metric("Downtime", format_seconds_to_clock(m1['Duration'].sum())); c1[2].metric("Avg", f"{(m1['Duration'].sum()/max(1,m1['Count'].sum())):.1f}s"); c1[3].metric("Active", m1[m1['Count']>0]['DeviceName'].nunique())
@@ -284,10 +305,9 @@ if upl:
                 if grid_c and grid_c.get('selection') and grid_c['selection'].get('rows'): st.session_state.dialog_trigger = {'m': diff.iloc[grid_c['selection']['rows'][0]]['DeviceName'], 'c': "All", 't': 'main'}
 
         with t_map["🔍 Fault Analysis"]:
-            f1_full_data = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['EventCode', 'EventDescription'], break_window=(brk_start, brk_end))
+            f1_full_data = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['EventCode', 'EventDescription'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
             if not comp_on:
                 f10 = f1_full_data.sort_values('Count', ascending=False).head(10) if not f1_full_data.empty else pd.DataFrame()
-                # REQ: Axis Title updated to Minutes logic
                 y_ax_label = "Total Occurrences" if s_met == "Count" else "Total Minutes"
                 fig_fb = px.bar(f10, x='EventCode', y='Count' if s_met=="Count" else f10['Duration']/60, title="Top 10 High-Impact Codes").update_layout(yaxis_title=y_ax_label)
                 st.plotly_chart(fig_fb, use_container_width=True)
@@ -295,12 +315,12 @@ if upl:
                 grid_f = st.dataframe(f10[['Action', 'EventCode', 'Count', 'Downtime', 'EventDescription']], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key=f"gf1_{st.session_state.tk_fault}")
                 if grid_f and grid_f.get('selection') and grid_f['selection'].get('rows'): st.session_state.dialog_trigger = {'m': s_dev, 'c': f10.iloc[grid_f['selection']['rows'][0]]['EventCode'], 't': 'fault'}
             else:
-                f1c = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['EventCode', 'DeviceName'], break_window=(brk_start, brk_end))
-                f2c = get_metrics_calculation(m_df, w2_start_dt, w2_end_dt, s_typ, s_dev, ['EventCode', 'DeviceName'], break_window=(brk_start, brk_end))
-                u_codes = list(set((f1_full_data.sort_values('Count', ascending=False).head(10)['EventCode'].tolist() if not f1_full_data.empty else []) + (get_metrics_calculation(m_df, w2_start_dt, w2_end_dt, s_typ, s_dev, ['EventCode'], break_window=(brk_start, brk_end)).sort_values('Count', ascending=False).head(10)['EventCode'].tolist() if comp_on else [])))
+                f1c = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['EventCode', 'DeviceName'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
+                f2c = get_metrics_calculation(m_df, w2_start_dt, w2_end_dt, s_typ, s_dev, ['EventCode', 'DeviceName'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
+                u_codes = list(set((f1_full_data.sort_values('Count', ascending=False).head(10)['EventCode'].tolist() if not f1_full_data.empty else []) + (get_metrics_calculation(m_df, w2_start_dt, w2_end_dt, s_typ, s_dev, ['EventCode'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets).sort_values('Count', ascending=False).head(10)['EventCode'].tolist() if comp_on else [])))
                 f_fh = create_cluster_stack_chart(f1c[f1c['EventCode'].isin(u_codes)], f2c[f2c['EventCode'].isin(u_codes)], 'EventCode', 'DeviceName', "Event Comparison Analysis", s_top, s_oth, s_met, desc_map=desc_lookup)
                 st.plotly_chart(f_fh, use_container_width=True)
-                f2_full_calc = get_metrics_calculation(m_df, w2_start_dt, w2_end_dt, s_typ, s_dev, ['EventCode', 'EventDescription'], break_window=(brk_start, brk_end))
+                f2_full_calc = get_metrics_calculation(m_df, w2_start_dt, w2_end_dt, s_typ, s_dev, ['EventCode', 'EventDescription'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
                 f_diff_tbl = pd.merge(f1_full_data[f1_full_data['EventCode'].isin(u_codes)], f2_full_calc[f2_full_calc['EventCode'].isin(u_codes)], on=['EventCode', 'EventDescription'], how='outer', suffixes=('_w1', '_w2')).fillna(0)
                 f_diff_tbl['Delta Count'], f_diff_tbl['Action'] = f_diff_tbl['Count_w2'] - f_diff_tbl['Count_w1'], "🔍 View Logs"
                 f_diff_tbl['Delta DT (Hrs)'], f_diff_tbl['Duration_w1'], f_diff_tbl['Duration_w2'] = ((f_diff_tbl['Duration_w2'] - f_diff_tbl['Duration_w1']) / 3600).round(2), f_diff_tbl['Duration_w1'].apply(format_seconds_to_clock), f_diff_tbl['Duration_w2'].apply(format_seconds_to_clock)
@@ -314,26 +334,43 @@ if upl:
                 sub = m_df[(m_df['EventDate'] >= dr_s) & (m_df['EventDate'] <= dr_e)].copy()
                 if b_win and b_win[0] != b_win[1]: sub = sub[~((sub['EventDate'].dt.time >= b_win[0]) & (sub['EventDate'].dt.time <= b_win[1]))]
                 if dev != "All": sub = sub[sub['DeviceName'] == dev]
-                sub = sub[sub['EventType'].isin(typs)]
+                
+                sub = sub[sub['EventType'].isin(typs)].copy()
+                if ignore_resets and not sub.empty:
+                    sub = sub.sort_values(by=['DeviceName', 'EventDate']).reset_index(drop=True)
+                    sub['SystemCounter'] = pd.to_numeric(sub['SystemCounter'], errors='coerce').fillna(0)
+                    
+                    sub['counter_changed'] = (sub['SystemCounter'] != sub.groupby('DeviceName')['SystemCounter'].shift(1))
+                    sub['block_id'] = sub.groupby('DeviceName')['counter_changed'].cumsum()
+                    
+                    max_block_dur = sub.groupby(['DeviceName', 'block_id'])['Duration'].transform('max')
+                    is_rep = sub.duplicated(subset=['DeviceName', 'block_id'], keep='first')
+                    
+                    sub['Duration'] = max_block_dur
+                    sub = sub[~is_rep]
+
                 if code != "All": sub = sub[sub['EventCode'] == code]
+                if sub.empty: return pd.DataFrame(columns=['EventDate', 'EventType', 'P', 'D'])
                 tr = sub.set_index('EventDate').groupby([pd.Grouper(freq=f_m[f_o]), 'EventType']).agg({'EventCode':'count', 'Duration':'sum'}).reset_index()
                 tr['P'] = tr['EventCode'] if s_met=="Count" else tr['Duration']/60
                 tr['D'] = tr['Duration'] / (60 if unit=="Minutes" else 1)
                 return tr
             t1 = get_tr(w1_start_dt, w1_end_dt, st.session_state.trend_event_code, s_dev, s_typ, s_unt, (brk_start, brk_end)); tc = st.columns(4)
-            tc[0].plotly_chart(px.line(t1, x='EventDate', y='P', color='EventType', markers=True, title="W1 Trend"), use_container_width=True)
-            tc[2].plotly_chart(px.line(t1, x='EventDate', y='D', color='EventType', markers=True, title="W1 Downtime (Minutes)"), use_container_width=True)
+            if not t1.empty:
+                tc[0].plotly_chart(px.line(t1, x='EventDate', y='P', color='EventType', markers=True, title="W1 Trend"), use_container_width=True)
+                tc[2].plotly_chart(px.line(t1, x='EventDate', y='D', color='EventType', markers=True, title="W1 Downtime (Minutes)"), use_container_width=True)
             if comp_on and w2_start_dt:
                 t2 = get_tr(w2_start_dt, w2_end_dt, st.session_state.trend_event_code, s_dev, s_typ, s_unt, (brk_start, brk_end))
-                tc[1].plotly_chart(px.line(t2, x='EventDate', y='P', color='EventType', markers=True, title="W2 Trend"), use_container_width=True)
-                tc[3].plotly_chart(px.line(t2, x='EventDate', y='D', color='EventType', markers=True, title="W2 Downtime (Minutes)"), use_container_width=True)
+                if not t2.empty:
+                    tc[1].plotly_chart(px.line(t2, x='EventDate', y='P', color='EventType', markers=True, title="W2 Trend"), use_container_width=True)
+                    tc[3].plotly_chart(px.line(t2, x='EventDate', y='D', color='EventType', markers=True, title="W2 Downtime (Minutes)"), use_container_width=True)
 
         with t_map["🛠️ Tech Log"]:
             with st.expander("📝 Record New Maintenance Action", expanded=False):
                 with st.form("entry_form", clear_on_submit=True):
                     c1_p, c2_p = st.columns(2)
                     f_m_p = c1_p.selectbox("Machine", sorted(m_df['DeviceName'].unique()))
-                    f_c_p = c1_p.selectbox("Fault Code", sorted(m_df[m_df['DeviceName']==f_m_p]['EventCode'].unique()))
+                    f_c_p = c1_p.selectbox("Fault Code", sorted(m_df[m_df['DeviceName']==f_m_p]['EventCode'].unique()), key=f"form_code_{f_m_p}")
                     f_t_p, f_d_p, f_a_p = c2_p.text_input("Tech Name"), c2_p.date_input("Date", datetime.now()), st.text_area("Resolution")
                     if st.form_submit_button("Save"):
                         db_conn.cursor().execute("INSERT INTO notes (DeviceName, EventCode, TechnicianName, CorrectiveAction, ActionDate) VALUES (?,?,?,?,?)", (f_m_p, f_c_p, f_t_p, f_a_p, str(f_d_p)))
@@ -396,8 +433,8 @@ if upl:
                     for j in range(4):
                         if i+j < len(active_fleet):
                             nm = active_fleet[i+j]
-                            mw1 = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, nm, ['DeviceName', 'EventCode'], break_window=(brk_start, brk_end))
-                            mw2 = get_metrics_calculation(m_df, w2_start_dt, w2_end_dt, s_typ, nm, ['DeviceName', 'EventCode'], break_window=(brk_start, brk_end)) if comp_on else pd.DataFrame()
+                            mw1 = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, nm, ['DeviceName', 'EventCode'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
+                            mw2 = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, nm, ['DeviceName', 'EventCode'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets) if comp_on else pd.DataFrame()
                             f = create_cluster_stack_chart(mw1, mw2, 'DeviceName', 'EventCode', nm, s_top, s_oth, s_met, desc_map=desc_lookup, is_gallery=True)
                             f.update_layout(height=350, showlegend=False)
                             with cols[j]: st.plotly_chart(f, use_container_width=True)
