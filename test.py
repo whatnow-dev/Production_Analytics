@@ -24,6 +24,8 @@ if 'tk_main' not in st.session_state: st.session_state.tk_main = 0
 if 'tk_fault' not in st.session_state: st.session_state.tk_fault = 100
 if 'dialog_trigger' not in st.session_state: st.session_state.dialog_trigger = None
 if 'selected_dashboard_machine' not in st.session_state: st.session_state.selected_dashboard_machine = None
+# NEW: Persistent tracking memory for the Fault Analysis bar chart
+if 'selected_fault_code' not in st.session_state: st.session_state.selected_fault_code = None
 
 def init_database():
     conn = sqlite3.connect('maintenance_data.db', check_same_thread=False)
@@ -343,14 +345,45 @@ if upl:
 
         with t_map["🔍 Fault Analysis"]:
             f1_full_data = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['EventCode', 'EventDescription'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
+            
             if not comp_on:
                 f10 = f1_full_data.sort_values('Count', ascending=False).head(10) if not f1_full_data.empty else pd.DataFrame()
-                y_ax_label = "Total Occurrences" if s_met == "Count" else "Total Minutes"
-                fig_fb = px.bar(f10, x='EventCode', y='Count' if s_met=="Count" else f10['Duration']/60, title="Top 10 High-Impact Codes").update_layout(yaxis_title=y_ax_label)
-                st.plotly_chart(fig_fb, use_container_width=True)
-                f10['Action'], f10['Downtime'] = "🔍 View Logs", f10['Duration'].apply(format_seconds_to_clock)
-                grid_f = st.dataframe(f10[['Action', 'EventCode', 'Count', 'Downtime', 'EventDescription']], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key=f"gf1_{st.session_state.tk_fault}")
-                if grid_f and grid_f.get('selection') and grid_f['selection'].get('rows'): st.session_state.dialog_trigger = {'m': s_dev, 'c': f10.iloc[grid_f['selection']['rows'][0]]['EventCode'], 't': 'fault'}
+                
+                if not f10.empty:
+                    y_ax_label = "Total Occurrences" if s_met == "Count" else "Total Minutes"
+                    fig_fb = px.bar(f10, x='EventCode', y='Count' if s_met=="Count" else f10['Duration']/60, title="Top 10 High-Impact Codes").update_layout(yaxis_title=y_ax_label)
+                    
+                    fc_left, fc_right = st.columns(2)
+                    with fc_left:
+                        fb_select = st.plotly_chart(fig_fb, use_container_width=True, on_select="rerun", key="fault_bar_chart")
+                        
+                        selected_code = None
+                        if fb_select and fb_select.get('selection') and fb_select['selection'].get('points'):
+                            pt = fb_select['selection']['points'][0]
+                            if pt.get('x'): selected_code = str(pt.get('x'))
+                            elif pt.get('label'): selected_code = str(pt.get('label'))
+                        
+                        if selected_code:
+                            st.session_state.selected_fault_code = selected_code
+                        elif not st.session_state.selected_fault_code:
+                            st.session_state.selected_fault_code = str(f10.iloc[0]['EventCode'])
+
+                    with fc_right:
+                        if st.session_state.selected_fault_code:
+                            code_breakdown = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, "All", ['DeviceName', 'EventCode'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
+                            code_breakdown = code_breakdown[code_breakdown['EventCode'] == st.session_state.selected_fault_code]
+                            if not code_breakdown.empty:
+                                fig_pie_fb = px.pie(code_breakdown, names='DeviceName', values='Count' if s_met=="Count" else 'Duration', hole=0.3, title=f"Code {st.session_state.selected_fault_code} Distribution (Fleet-Wide)")
+                                st.plotly_chart(fig_pie_fb, use_container_width=True, key=f"fault_pie_{st.session_state.selected_fault_code}")
+                            else:
+                                st.info("No distribution data available.")
+                
+                    f10['Action'], f10['Downtime'] = "🔍 View Logs", f10['Duration'].apply(format_seconds_to_clock)
+                    grid_f = st.dataframe(f10[['Action', 'EventCode', 'Count', 'Downtime', 'EventDescription']], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key=f"gf1_{st.session_state.tk_fault}")
+                    if grid_f and grid_f.get('selection') and grid_f['selection'].get('rows'): st.session_state.dialog_trigger = {'m': s_dev, 'c': f10.iloc[grid_f['selection']['rows'][0]]['EventCode'], 't': 'fault'}
+                else:
+                    st.info("No data available for the selected filters.")
+
             else:
                 f1c = get_metrics_calculation(m_df, w1_start_dt, w1_end_dt, s_typ, s_dev, ['EventCode', 'DeviceName'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
                 f2c = get_metrics_calculation(m_df, w2_start_dt, w2_end_dt, s_typ, s_dev, ['EventCode', 'DeviceName'], break_window=(brk_start, brk_end), ignore_resets=ignore_resets)
